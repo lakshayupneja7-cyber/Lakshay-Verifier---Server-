@@ -1,0 +1,5 @@
+name: LakshayVerifier
+version: 1.0
+main: me.lakshay.verifier.VerifierPlugin
+api-version: 1.21
+author: Lakshay
