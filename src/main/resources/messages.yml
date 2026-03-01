@@ -1,0 +1,13 @@
+# LakshayVerifier messages
+
+missingVerifier: "§cPlease install the Server Verifier mod, then rejoin."
+timeout: "§cVerification timed out. Please rejoin."
+
+# Default message when a blacklisted mod is found
+blacklistedDefault: "§cPlease remove {mods}, then rejoin ..."
+
+# Optional: custom messages per mod-id
+# If mod exists here, that message is used (first match).
+perMod:
+  freecam: "§cFreeCam is not allowed. §7Remove it and rejoin."
+  autototem: "§cAutoTotem is not allowed. §7Remove it and rejoin."
