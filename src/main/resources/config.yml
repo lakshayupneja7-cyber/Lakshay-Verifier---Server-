@@ -1,0 +1,21 @@
+# LakshayVerifier config
+
+# Require client verifier mod?
+requireVerifier: true
+
+# How many seconds to wait for client response before kicking
+timeoutSeconds: 25
+
+# Send REQ after join delay (ticks). 20 ticks = 1 second
+firstSendDelayTicks: 40
+
+# Resend interval (ticks)
+resendEveryTicks: 40
+
+# Max request attempts before giving up
+maxAttempts: 6
+
+# Blacklisted mod IDs (lowercase)
+blacklist:
+  - freecam
+  - autototem
