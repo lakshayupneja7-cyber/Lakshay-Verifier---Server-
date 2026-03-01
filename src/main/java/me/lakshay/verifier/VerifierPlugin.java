@@ -1,6 +1,8 @@
 package me.lakshay.verifier;
 
 import org.bukkit.Bukkit;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
@@ -8,7 +10,10 @@ import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerQuitEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.bukkit.plugin.messaging.PluginMessageListener;
+import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.configuration.file.YamlConfiguration;
 
+import java.io.File;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
@@ -17,34 +22,40 @@ public final class VerifierPlugin extends JavaPlugin implements Listener, Plugin
 
     private static final String CHANNEL = "lakshay:verify";
 
-    private static final boolean REQUIRE_VERIFIER = true;
+    // loaded from config.yml
+    private boolean requireVerifier;
+    private int timeoutSeconds;
+    private long firstSendDelayTicks;
+    private long resendEveryTicks;
+    private int maxAttempts;
+    private Set<String> blacklist = new HashSet<>();
 
-    private static final String KICK_MISSING = "§cPlease install the server verifier mod, then rejoin.";
-    private static final String KICK_BLACKLIST = "§cPlease Remove %s, then rejoin ...";
+    // messages.yml
+    private File messagesFile;
+    private FileConfiguration messages;
 
-    // ✅ More forgiving timing
-    private static final int TIMEOUT_SECONDS = 25;     // total time allowed
-    private static final int FIRST_SEND_DELAY_TICKS = 40; // 2 seconds after join
-    private static final int RESEND_EVERY_TICKS = 40;  // resend every 2 seconds
-    private static final int MAX_ATTEMPTS = 6;         // up to 6 tries
-
-    private final Set<String> blacklist = new HashSet<>(Arrays.asList(
-            "freecam",
-            "autototem"
-    ));
-
+    // state
     private final Map<UUID, Long> deadlineMs = new ConcurrentHashMap<>();
     private final Set<UUID> verified = ConcurrentHashMap.newKeySet();
     private final Map<UUID, Integer> attempts = new ConcurrentHashMap<>();
 
     @Override
     public void onEnable() {
-        Bukkit.getPluginManager().registerEvents(this, this);
+        // 1) create folder + config.yml
+        saveDefaultConfig();
 
+        // 2) create messages.yml
+        setupMessagesFile();
+
+        // 3) load settings
+        reloadAll();
+
+        // 4) events + channels
+        Bukkit.getPluginManager().registerEvents(this, this);
         getServer().getMessenger().registerIncomingPluginChannel(this, CHANNEL, this);
         getServer().getMessenger().registerOutgoingPluginChannel(this, CHANNEL);
 
-        // Timeout checker (kicks if no verification)
+        // 5) timeout checker
         Bukkit.getScheduler().runTaskTimer(this, () -> {
             long now = System.currentTimeMillis();
             for (Player p : Bukkit.getOnlinePlayers()) {
@@ -56,17 +67,61 @@ public final class VerifierPlugin extends JavaPlugin implements Listener, Plugin
                     deadlineMs.remove(id);
                     attempts.remove(id);
 
-                    if (REQUIRE_VERIFIER) {
+                    if (requireVerifier) {
                         getLogger().warning("No verifier response from " + p.getName() + " (timed out)");
-                        p.kickPlayer(KICK_MISSING);
-                    } else {
-                        getLogger().warning("Player " + p.getName() + " joined without verifier response.");
+                        p.kickPlayer(color(msg("timeout", "§cVerification timed out. Please rejoin."), p, ""));
                     }
                 }
             }
         }, 20L, 20L);
 
         getLogger().info("LakshayVerifier enabled.");
+    }
+
+    private void reloadAll() {
+        reloadConfig();
+        loadMainConfig();
+        messages = YamlConfiguration.loadConfiguration(messagesFile);
+        getLogger().info("Loaded blacklist: " + blacklist);
+    }
+
+    private void loadMainConfig() {
+        requireVerifier = getConfig().getBoolean("requireVerifier", true);
+        timeoutSeconds = getConfig().getInt("timeoutSeconds", 25);
+        firstSendDelayTicks = getConfig().getLong("firstSendDelayTicks", 40L);
+        resendEveryTicks = getConfig().getLong("resendEveryTicks", 40L);
+        maxAttempts = getConfig().getInt("maxAttempts", 6);
+
+        blacklist.clear();
+        for (String s : getConfig().getStringList("blacklist")) {
+            if (s == null) continue;
+            blacklist.add(s.trim().toLowerCase(Locale.ROOT));
+        }
+    }
+
+    private void setupMessagesFile() {
+        messagesFile = new File(getDataFolder(), "messages.yml");
+        if (!messagesFile.exists()) {
+            saveResource("messages.yml", false); // copies from src/main/resources/messages.yml
+        }
+    }
+
+    @Override
+    public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
+        if (!command.getName().equalsIgnoreCase("verifier")) return false;
+
+        if (args.length == 1 && args[0].equalsIgnoreCase("reload")) {
+            if (!sender.hasPermission("verifier.reload")) {
+                sender.sendMessage("§cNo permission.");
+                return true;
+            }
+            reloadAll();
+            sender.sendMessage("§aLakshayVerifier reloaded.");
+            return true;
+        }
+
+        sender.sendMessage("§7Usage: §f/verifier reload");
+        return true;
     }
 
     @EventHandler
@@ -76,10 +131,9 @@ public final class VerifierPlugin extends JavaPlugin implements Listener, Plugin
 
         verified.remove(id);
         attempts.put(id, 0);
-        deadlineMs.put(id, System.currentTimeMillis() + TIMEOUT_SECONDS * 1000L);
+        deadlineMs.put(id, System.currentTimeMillis() + timeoutSeconds * 1000L);
 
-        // ✅ Send later + resend (because first packets can get lost)
-        Bukkit.getScheduler().runTaskLater(this, () -> startResendLoop(p), FIRST_SEND_DELAY_TICKS);
+        Bukkit.getScheduler().runTaskLater(this, () -> startResendLoop(p), firstSendDelayTicks);
     }
 
     private void startResendLoop(Player p) {
@@ -89,16 +143,16 @@ public final class VerifierPlugin extends JavaPlugin implements Listener, Plugin
         if (verified.contains(id)) return;
 
         int a = attempts.getOrDefault(id, 0);
-        if (a >= MAX_ATTEMPTS) return;
+        if (a >= maxAttempts) {
+            // give up; timeout checker will kick later (if requireVerifier)
+            return;
+        }
 
         attempts.put(id, a + 1);
 
-        // Debug
-        getLogger().info("Sending REQ to " + p.getName() + " (attempt " + (a + 1) + "/" + MAX_ATTEMPTS + ")");
-
         p.sendPluginMessage(this, CHANNEL, "REQ".getBytes(StandardCharsets.UTF_8));
 
-        Bukkit.getScheduler().runTaskLater(this, () -> startResendLoop(p), RESEND_EVERY_TICKS);
+        Bukkit.getScheduler().runTaskLater(this, () -> startResendLoop(p), resendEveryTicks);
     }
 
     @EventHandler
@@ -115,9 +169,6 @@ public final class VerifierPlugin extends JavaPlugin implements Listener, Plugin
 
         String payload = new String(message, StandardCharsets.UTF_8);
 
-        // Debug: log ANY message on that channel
-        getLogger().info("Received on " + CHANNEL + " from " + player.getName() + ": " + payload);
-
         if (!payload.startsWith("MODS|")) return;
 
         UUID id = player.getUniqueId();
@@ -126,20 +177,53 @@ public final class VerifierPlugin extends JavaPlugin implements Listener, Plugin
         attempts.remove(id);
 
         String list = payload.substring("MODS|".length()).trim();
+
         Set<String> mods = new HashSet<>();
         if (!list.isEmpty()) {
-            for (String m : list.split(",")) mods.add(m.trim().toLowerCase(Locale.ROOT));
+            for (String m : list.split(",")) {
+                mods.add(m.trim().toLowerCase(Locale.ROOT));
+            }
         }
 
-        getLogger().info("Mods for " + player.getName() + ": " + String.join(", ", mods));
-
+        // Find blacklisted mods
         List<String> found = new ArrayList<>();
         for (String bad : blacklist) {
             if (mods.contains(bad)) found.add(bad);
         }
 
         if (!found.isEmpty()) {
-            player.kickPlayer(String.format(KICK_BLACKLIST, String.join(", ", found)));
+            // Per-mod message (first match wins)
+            String chosen = null;
+            for (String bad : found) {
+                String per = messages.getString("perMod." + bad);
+                if (per != null && !per.isBlank()) {
+                    chosen = per;
+                    break;
+                }
+            }
+
+            if (chosen == null) {
+                chosen = msg("blacklistedDefault", "§cPlease remove {mods}, then rejoin ...");
+            }
+
+            String modsText = String.join(", ", found);
+            player.kickPlayer(color(chosen, player, modsText));
+            return;
         }
+
+        // If not blacklisted -> allow
+    }
+
+    private String msg(String key, String def) {
+        String v = messages.getString(key);
+        return (v == null || v.isBlank()) ? def : v;
+    }
+
+    private String color(String s, Player p, String modsText) {
+        return s
+                .replace("{player}", p.getName())
+                .replace("{mods}", modsText)
+                .replace("{plural}", modsText.contains(",") ? "s" : "")
+                .replace("&", "§");
     }
 }
